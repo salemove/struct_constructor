@@ -88,6 +88,11 @@ defmodule StructConstructor do
   end
   defp after_load(struct, [embed | rest]) do
     case struct do
+      %{^embed => value} when is_list(value) ->
+        struct
+        |> Map.put(embed, Enum.map(value, &after_load/1))
+        |> after_load(rest)
+
       %{^embed => value} when not is_nil(value) ->
         struct
         |> Map.put(embed, after_load(value))

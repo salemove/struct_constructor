@@ -23,6 +23,16 @@ defmodule StructConstructorTest do
     end
   end
 
+  defmodule StructWithEmbedMany do
+    use StructConstructor do
+      field :id, :integer
+      embeds_one :user, User
+      embeds_many :inline, Inline do
+        field :name, :string
+      end
+    end
+  end
+
   @timestamp %DateTime{year: 2017, month: 4, day: 22,
     hour: 4, minute: 4, second: 4, microsecond: {0, 0},
     utc_offset: 0, std_offset: 0, time_zone: "Etc/UTC", zone_abbr: "UTC"}
@@ -45,7 +55,7 @@ defmodule StructConstructorTest do
     assert user.status == :loaded
   end
 
-  test "supports embed schemas" do
+  test "supports embed_one schemas" do
     struct = StructWithEmbed.new(
       id: 123,
       user: %{name: "Alex", age: 27, timestamp: DateTime.to_iso8601(@timestamp)},
@@ -55,5 +65,17 @@ defmodule StructConstructorTest do
     assert struct.id == 123
     assert struct.user == %User{name: "Alex", age: 27, timestamp: @timestamp, status: :loaded}
     assert struct.inline == %StructWithEmbed.Inline{name: "Dan"}
+  end
+
+  test "supports embed_many schemas" do
+    struct = StructWithEmbedMany.new(
+      id: 123,
+      user: %{name: "Alex", age: 27, timestamp: DateTime.to_iso8601(@timestamp)},
+      inline: [%{name: "Dan"}]
+    )
+
+    assert struct.id == 123
+    assert struct.user == %User{name: "Alex", age: 27, timestamp: @timestamp, status: :loaded}
+    assert struct.inline == [%StructWithEmbedMany.Inline{name: "Dan"}]
   end
 end
