@@ -4,7 +4,7 @@ defmodule StructConstructor.Mixfile do
   def project do
     [
       app: :struct_constructor,
-      version: "0.1.0",
+      version: "0.1.1",
       elixir: "~> 1.4",
       start_permanent: Mix.env == :prod,
       build_embedded: Mix.env == :prod,
