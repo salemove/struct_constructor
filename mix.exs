@@ -44,8 +44,8 @@ defmodule StructConstructor.Mixfile do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:ecto, "~> 2.0"},
-      {:ex_doc, "~> 0.16", only: :dev}
+      {:ecto, "~> 2.0 or ~> 3.0"},
+      {:ex_doc, "~> 0.19", only: :dev}
     ]
   end
 end
