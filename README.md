@@ -13,7 +13,7 @@ Add `struct_constructor` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:struct_constructor, "~> 0.1.0"}
+    {:struct_constructor, "~> 0.2.0"}
   ]
 end
 ```
@@ -42,4 +42,4 @@ Note, that `:age` attribute was automatically converted to integer.
 
 ## License
 
-MIT License, Copyright (c) 2017 SaleMove
+MIT License, Copyright (c) 2017-2018 SaleMove
