@@ -31,10 +31,11 @@ defmodule StructConstructor do
       @doc """
       Initialize `#{__MODULE__}` struct from map or keyword list
       """
-      @spec new(map | Keyword.t) :: struct
+      @spec new(map | Keyword.t()) :: struct
       def new(kwlist) when is_list(kwlist) do
         new(Map.new(kwlist))
       end
+
       def new(map) when is_map(map) do
         StructConstructor.new(__MODULE__, map)
       end
@@ -46,7 +47,7 @@ defmodule StructConstructor do
       def after_load(struct),
         do: struct
 
-      defoverridable [after_load: 1]
+      defoverridable after_load: 1
     end
   end
 
@@ -69,6 +70,7 @@ defmodule StructConstructor do
 
   defp cast_embeds(changeset, []),
     do: changeset
+
   defp cast_embeds(changeset, [embed | rest]) do
     changeset
     |> Changeset.cast_embed(embed, with: &build_changeset/2)
@@ -86,6 +88,7 @@ defmodule StructConstructor do
       struct
     end
   end
+
   defp after_load(struct, [embed | rest]) do
     case struct do
       %{^embed => value} when is_list(value) ->

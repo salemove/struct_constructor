@@ -4,10 +4,10 @@ defmodule StructConstructor.Mixfile do
   def project do
     [
       app: :struct_constructor,
-      version: "0.1.1",
-      elixir: "~> 1.4",
-      start_permanent: Mix.env == :prod,
-      build_embedded: Mix.env == :prod,
+      version: "0.2.0",
+      elixir: "~> 1.5",
+      start_permanent: Mix.env() == :prod,
+      build_embedded: Mix.env() == :prod,
       deps: deps(),
       package: package(),
       description: description(),
@@ -44,8 +44,8 @@ defmodule StructConstructor.Mixfile do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:ecto, "~> 2.0"},
-      {:ex_doc, "~> 0.16", only: :dev}
+      {:ecto, "~> 2.0 or ~> 3.0"},
+      {:ex_doc, "~> 0.19", only: :dev}
     ]
   end
 end
