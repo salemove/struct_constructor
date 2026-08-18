@@ -1,3 +1,7 @@
+# Inlined copy of the scan steps from
+# salemove/glia-security-workflows/.github/workflows/elixir-snyk-security-scan.yaml.
+# This repository is public and cannot call that private reusable workflow,
+# so the steps live here directly. If the shared workflow changes, sync this copy.
 name: Snyk Elixir Security Scan
 
 on:
@@ -14,7 +18,34 @@ permissions:
   contents: read
 
 jobs:
-  security-scan:
-    uses: salemove/glia-security-workflows/.github/workflows/elixir-snyk-security-scan.yaml@master
-    secrets:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  snyk-scan:
+    runs-on: ubuntu-latest
+    env:
+      SNYK_CFG_ORG: ${{ vars.SNYK_ORGANIZATION_SLUG }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Set up Snyk CLI
+        uses: snyk/actions/setup@cdb760004ba9ea4d525f2e043745dfe85bb9077e
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@5304e04ea2b355f03681464e683d92e3b2f18451
+        with:
+          otp-version: '27'
+          elixir-version: '1.18'
+
+      - name: Update project monitoring in Snyk
+        # Never monitor without an explicit org: with SNYK_CFG_ORG empty the CLI
+        # falls back to the token's default org and recreates projects there.
+        if: github.event_name == 'push' && vars.SNYK_ORGANIZATION_SLUG != ''
+        run: snyk monitor --project-name=${{ github.repository }} --file=mix.exs
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Run Snyk to check for vulnerabilities
+        run: snyk test --project-name=${{ github.repository }} --severity-threshold=high --print-deps --package-manager=hex --file=mix.exs
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
