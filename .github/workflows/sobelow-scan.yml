@@ -1,23 +1,3 @@
-# Sobelow static analysis (SAST) for public repositories.
-#
-# Public repos cannot run the org-level "Sobelow Security Scan" workflow: its
-# file lives in the private salemove/glia-security-workflows, and GitHub
-# refuses to require a workflow from a less visible repository. So they carry
-# this copy, exactly as they do for gitleaks and Snyk.
-#
-# THIS IS A COPY. The canonical version is
-# salemove/glia-security-workflows/.github/workflows/sobelow-ruleset.yaml —
-# keep this in sync when that changes, and make behavioural changes there
-# first so the private fleet and these repositories cannot drift apart.
-#
-# Unlike the gitleaks and Snyk copies, this one needs NO secrets, so it works
-# on pull requests from forks too: the scan runs normally. Only the findings
-# comment cannot post there, because a fork PR gets a read-only token — the
-# comment step is `continue-on-error` precisely so that degrades to "no
-# comment" instead of a red check.
-#
-# Reporting only. Sobelow is invoked without `--exit`, so it always returns a
-# zero exit status and this check can never fail on findings.
 name: Sobelow Security Scan
 
 # Configuration lives in `SOBELOW_DEFAULT_IGNORE` below, or in a
