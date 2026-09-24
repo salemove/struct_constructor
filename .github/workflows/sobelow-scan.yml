@@ -1,0 +1,267 @@
+name: Sobelow Security Scan
+
+# Configuration lives in `SOBELOW_DEFAULT_IGNORE` below, or in a
+# `.sobelow-conf` file committed at the root of the scanned project, which
+# Sobelow reads automatically. A project that ships one owns its ignore list
+# outright — see the Run Sobelow step.
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+env:
+  # Pinned deliberately. Sobelow gates every Elixir production repository, so
+  # an unpinned version would let a new upstream release change findings
+  # everywhere at once. Bump this in a PR of its own.
+  SOBELOW_VERSION: "0.15.0"
+  # In env rather than inline so the escript cache key can include them: the
+  # escript is compiled by this toolchain, so bumping either must invalidate
+  # a cached build.
+  OTP_VERSION: "27"
+  ELIXIR_VERSION: "1.18"
+  # Checks that are wrong for every service we run, ignored by default.
+  #
+  # Config.HTTPS fires on the absence of `force_ssl` in config/prod.exs, which
+  # is where it would be if we terminated TLS in the application. We terminate
+  # it at the ingress, so the check is a false positive estate-wide — and a
+  # high-confidence one, which makes it the loudest thing in every report.
+  #
+  # Comma-separated; DevHub suppresses the same check in its own
+  # sast_policy.yaml, so keep the two in step.
+  SOBELOW_DEFAULT_IGNORE: "Config.HTTPS"
+
+jobs:
+  sobelow-scan:
+    name: sobelow-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Declared on the job rather than the workflow so the grant cannot widen
+    # to jobs added later. `pull-requests: write` is needed only by the final
+    # step, which posts the results comment.
+    permissions:
+      contents: read
+      pull-requests: write
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3  # v6 (node24)
+        with:
+          persist-credentials: false
+
+      # Not every repository in scope keeps its Elixir project at the root.
+      # Seven hold it in a subdirectory alongside another language
+      # (`elixir/`, `api/`, `exdocs/`), and one is a monorepo of several
+      # libraries. Scanning only the root would leave those reporting a green
+      # required check having scanned nothing at all.
+      #
+      # A root mix.exs is taken as the single project: Sobelow handles umbrella
+      # applications itself, so descending further would double-scan.
+      #
+      # The ruleset scopes this workflow to Elixir repositories, but a required
+      # workflow cannot assert that for itself, so finding no project at all is
+      # reported and passes rather than failing a required check.
+      - name: Discover Elixir projects
+        id: detect
+        run: |
+          if [ -f mix.exs ]; then
+            echo "." > sobelow-roots.txt
+          else
+            find . -maxdepth 3 -name mix.exs \
+              -not -path './.git/*' \
+              -not -path '*/deps/*' \
+              -not -path '*/_build/*' \
+              -exec dirname {} \; 2>/dev/null | sort -u > sobelow-roots.txt
+          fi
+
+          if [ -s sobelow-roots.txt ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Elixir projects to scan:"
+            sed 's/^/  /' sobelow-roots.txt
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No mix.exs found - nothing for Sobelow to scan."
+          fi
+
+      - name: Set up Elixir
+        if: steps.detect.outputs.found == 'true'
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124  # v1.24.1 (node24)
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      # The escript is an immutable build of a pinned version, so a plain
+      # key with no restore-keys is correct: either it is exactly this
+      # toolchain's build or it is rebuilt.
+      - name: Cache Sobelow escript
+        id: cache-sobelow
+        if: steps.detect.outputs.found == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ~/.mix/escripts
+          key: ${{ runner.os }}-sobelow-${{ env.SOBELOW_VERSION }}-otp${{ env.OTP_VERSION }}-elixir${{ env.ELIXIR_VERSION }}
+
+      # Skipped on a cache hit, which also skips `mix local.hex`. That is safe:
+      # the escript is self-contained and does not need hex to run, only to be
+      # fetched.
+      - name: Install Sobelow
+        if: steps.detect.outputs.found == 'true' && steps.cache-sobelow.outputs.cache-hit != 'true'
+        run: |
+          mix local.hex --force
+          mix escript.install hex sobelow "${SOBELOW_VERSION}" --force
+
+      # Deliberately no --exit: findings are reported but do not fail the check
+      # yet. The gate is switched on per the rollout plan, once each
+      # repository's existing backlog has been triaged.
+      #
+      # --skip honours the `#sobelow_skip` annotations teams already maintain
+      # for their Jenkins `mix lint` run. --private suppresses the upstream
+      # version check, which would otherwise make a network call on every run.
+      - name: Run Sobelow
+        if: steps.detect.outputs.found == 'true'
+        run: |
+          set -o pipefail
+          status=0
+          : > sobelow-output.txt
+          # The loop reads roots from fd 3, and Sobelow's stdin comes from
+          # /dev/null. Both matter: the escript is `#!/usr/bin/env escript`
+          # with no `-noinput`, so the Erlang VM opens and drains stdin. With
+          # the roots file piped in on stdin the escript consumed the
+          # remaining lines, `read` saw EOF, and every project after the first
+          # was silently left unscanned.
+          while IFS= read -r root <&3; do
+            [ -n "${root}" ] || continue
+
+            # The default ignore list is applied ONLY to projects that have not
+            # taken over their own configuration.
+            #
+            # Sobelow lets a command-line --ignore REPLACE the `ignore:` list in
+            # a .sobelow-conf rather than add to it, so passing ours to a repo
+            # that ships one would silently throw away every suppression that
+            # repo had decided on. A project with a .sobelow-conf owns its
+            # ignores outright, Config.HTTPS included; everything else gets the
+            # estate-wide default.
+            ignore_flag="--ignore ${SOBELOW_DEFAULT_IGNORE}"
+            if [ -f "${root}/.sobelow-conf" ]; then
+              ignore_flag=""
+              echo "${root}: .sobelow-conf present — leaving its ignore list untouched"
+            fi
+
+            printf '=== %s ===\n' "${root}" | tee -a sobelow-output.txt
+            # ${ignore_flag} is deliberately unquoted: it is a flag plus its
+            # value, or nothing at all.
+            # shellcheck disable=SC2086
+            "${HOME}/.mix/escripts/sobelow" --root "${root}" ${ignore_flag} --skip --private </dev/null 2>&1 \
+              | tee -a sobelow-output.txt || status=$?
+          done 3< sobelow-roots.txt
+          exit "${status}"
+
+      # Sobelow colours its output, which renders as escape-code noise
+      # anywhere other than the log. Keep the coloured copy for the log and
+      # derive a clean one for the summary and the pull request comment.
+      - name: Render findings
+        id: render
+        if: always() && steps.detect.outputs.found == 'true'
+        run: |
+          # Strip the colour codes, and drop Sobelow's ASCII banner: it is
+          # fine in a terminal but pure noise in a comment. Every banner line
+          # both starts and ends with '#', which no finding line does.
+          sed -E 's/\x1b\[[0-9;]*m//g' sobelow-output.txt \
+            | sed -E '/^#.*#$/d' > sobelow-clean.txt
+          count=$(grep -cE ' - (High|Medium|Low) Confidence' sobelow-clean.txt || true)
+          echo "count=${count:-0}" >> "$GITHUB_OUTPUT"
+          echo "Sobelow reported ${count:-0} finding(s)."
+
+          {
+            echo "### Sobelow ${SOBELOW_VERSION}"
+            echo
+            echo "${count:-0} finding(s). This check does not fail on findings."
+            echo
+            echo '```text'
+            head -c 60000 sobelow-clean.txt
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      # Post the results as a single, updated-in-place comment so they are
+      # visible on the pull request itself rather than only inside the run.
+      #
+      # continue-on-error: the comment is a convenience. A failure to post it
+      # (a fork PR gets a read-only token, for instance) must never turn the
+      # scan check red.
+      - name: Comment on the pull request
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FOUND: ${{ steps.detect.outputs.found }}
+          COUNT: ${{ steps.render.outputs.count }}
+          MARKER: "<!-- sobelow-scan -->"
+        run: |
+          set -euo pipefail
+
+          # Find a previous comment from this workflow, if any.
+          existing=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq "[.[] | select(.user.login == \"github-actions[bot]\")
+                       | select(.body | contains(\"${MARKER}\")) | .id] | first // empty")
+
+          # Stay quiet when there is nothing to say and nothing to correct:
+          # a clean scan on every pull request across every repository would
+          # be pure noise. An existing comment is still updated, so it does
+          # not sit there claiming findings that have since been fixed.
+          if [ "${FOUND}" = "true" ] && [ "${COUNT:-0}" = "0" ] && [ -z "${existing}" ]; then
+            echo "Clean scan and no existing comment; nothing to post."
+            exit 0
+          fi
+
+          {
+            echo "${MARKER}"
+            echo "### Sobelow ${SOBELOW_VERSION}"
+            echo
+            if [ "${FOUND}" != "true" ]; then
+              echo "**No Elixir project found**, so nothing was scanned."
+              echo
+              echo "No \`mix.exs\` was found within three directory levels of the"
+              echo "repository root. If this repository is meant to be covered by the"
+              echo "\`sobelow\` ruleset then that is worth a look, because the check is"
+              echo "passing without having analysed anything."
+            elif [ "${COUNT:-0}" = "0" ]; then
+              echo "No findings."
+            else
+              echo "**${COUNT} finding(s).** This check reports them but does not fail on"
+              echo "them, and does not block merging."
+              echo
+              echo "<details><summary>Findings</summary>"
+              echo
+              echo '```text'
+              head -c 60000 sobelow-clean.txt
+              echo '```'
+              echo
+              echo "</details>"
+              echo
+              echo "Tune this per repository with a \`.sobelow-conf\` file, or suppress a"
+              echo "single occurrence with a \`# sobelow_skip [\"Check.Name\"]\` annotation."
+            fi
+            echo
+            echo "<sub>Sobelow ${SOBELOW_VERSION} · [docs](https://github.com/salemove/glia-security-workflows/blob/master/docs/sobelow.md)</sub>"
+          } > comment.md
+
+          jq -Rs '{body: .}' < comment.md > payload.json
+
+          if [ -n "${existing}" ]; then
+            gh api --method PATCH "repos/${REPO}/issues/comments/${existing}" --input payload.json --silent
+            echo "Updated comment ${existing}."
+          else
+            gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" --input payload.json --silent
+            echo "Created a new comment."
+          fi
