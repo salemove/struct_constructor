@@ -30,6 +30,8 @@ jobs:
 
       - name: Set up Snyk CLI
         uses: snyk/actions/setup@cdb760004ba9ea4d525f2e043745dfe85bb9077e
+        with:
+          snyk-version: v1.1307.4
 
       - name: Set up Elixir
         uses: erlef/setup-beam@5304e04ea2b355f03681464e683d92e3b2f18451
