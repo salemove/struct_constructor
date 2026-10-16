@@ -1,0 +1,382 @@
+name: Hex Audit
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - master
+
+permissions: {}
+
+env:
+  HEX_VERSION: "2.5.3"
+  OTP_VERSION: "28"
+  ELIXIR_VERSION: "1.20"
+  HEX_AUDIT_ENFORCE: "false"
+
+jobs:
+  hex-audit-scan:
+    name: hex-audit-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          path: repo
+          persist-credentials: false
+
+      - name: Discover lockfiles
+        id: detect
+        working-directory: repo
+        run: |
+          mkdir -p "${RUNNER_TEMP}/hex-audit"
+          locks="${RUNNER_TEMP}/hex-audit/locks.txt"
+
+          find . -maxdepth 3 -name mix.lock \
+            -not -path './.git/*' \
+            -not -path '*/deps/*' \
+            -not -path '*/_build/*' 2>/dev/null | LC_ALL=C sort > "${locks}"
+
+          if [ -s "${locks}" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Lockfiles to scan:"
+            sed 's/^/  /' "${locks}"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No mix.lock found - nothing to scan."
+          fi
+
+      - name: Set up Elixir
+        if: steps.detect.outputs.found == 'true'
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          install-hex: false
+          install-rebar: false
+
+      - name: Install Hex
+        if: steps.detect.outputs.found == 'true'
+        run: |
+          mix local.hex "${HEX_VERSION}" --force
+
+      - name: Run mix hex.audit
+        id: audit
+        if: steps.detect.outputs.found == 'true'
+        working-directory: repo
+        run: |
+          work="${RUNNER_TEMP}/hex-audit"
+          stub="${work}/stub"
+          report="${work}/report.txt"
+          mkdir -p "${stub}"
+          : > "${report}"
+
+          cat > "${stub}/mix.exs" <<'ELIXIR'
+          defmodule HexAuditStub do
+            @moduledoc false
+
+            @ignore_keys [:ignore_advisories, :ignore_retirements]
+
+            def lockfile do
+              path = System.fetch_env!("HEX_AUDIT_LOCK")
+
+              with {:ok, source} <- File.read(path),
+                   {:ok, {:%{}, _, _} = quoted} <- Code.string_to_quoted(source),
+                   true <- Macro.quoted_literal?(quoted) do
+                path
+              else
+                _ -> Mix.raise("hex-audit: the lock is not a literal map, so it was not read")
+              end
+            end
+
+            def ignores do
+              case System.get_env("HEX_AUDIT_MIX_EXS", "") do
+                "" -> []
+                path -> path |> read_ignores() |> warn_unless_ok()
+              end
+            end
+
+            defp read_ignores(path) do
+              with {:ok, source} <- File.read(path),
+                   {:ok, quoted} <- Code.string_to_quoted(source) do
+                quoted |> hex_config() |> resolve(attributes(quoted))
+              else
+                _ -> :error
+              end
+            end
+
+            defp warn_unless_ok({:ok, ignores}), do: ignores
+
+            defp warn_unless_ok(:error) do
+              IO.puts(:stderr, "hex-audit: could not read the hex ignore lists")
+              []
+            end
+
+            defp hex_config(quoted) do
+              {_, found} =
+                Macro.prewalk(quoted, nil, fn
+                  {:hex, value} = node, nil when is_list(value) ->
+                    if Enum.any?(value, &match?({key, _} when key in @ignore_keys, &1)),
+                      do: {node, value},
+                      else: {node, nil}
+
+                  node, found ->
+                    {node, found}
+                end)
+
+              found || []
+            end
+
+            defp attributes(quoted) do
+              {_, attributes} =
+                Macro.prewalk(quoted, %{}, fn
+                  {:@, _, [{name, _, [value]}]} = node, acc when is_atom(name) ->
+                    {node, Map.put(acc, name, value)}
+
+                  node, acc ->
+                    {node, acc}
+                end)
+
+              attributes
+            end
+
+            defp resolve(config, attributes) do
+              Enum.reduce_while(@ignore_keys, {:ok, []}, fn key, {:ok, acc} ->
+                case config |> Keyword.get(key) |> literal(attributes) do
+                  {:ok, nil} -> {:cont, {:ok, acc}}
+                  {:ok, value} -> {:cont, {:ok, [{key, value} | acc]}}
+                  :error -> {:halt, :error}
+                end
+              end)
+            end
+
+            defp literal(nil, _attributes), do: {:ok, nil}
+
+            defp literal({:@, _, [{name, _, context}]}, attributes) when is_atom(context) do
+              case Map.fetch(attributes, name) do
+                {:ok, value} -> literal(value, %{})
+                :error -> :error
+              end
+            end
+
+            defp literal(value, _attributes) when is_list(value) do
+              if Macro.quoted_literal?(value), do: {:ok, value}, else: :error
+            end
+
+            defp literal(_value, _attributes), do: :error
+          end
+
+          defmodule HexAuditStub.MixProject do
+            use Mix.Project
+
+            def project do
+              [
+                app: :hex_audit_stub,
+                version: "0.0.0",
+                deps: [],
+                lockfile: HexAuditStub.lockfile(),
+                hex: HexAuditStub.ignores()
+              ]
+            end
+          end
+          ELIXIR
+
+          esc=$(printf '\033')
+          gated=0
+          other=0
+          retired=0
+          ignored=0
+          errors=0
+
+          while IFS= read -r lock <&3; do
+            [ -n "${lock}" ] || continue
+            dir=$(dirname "${lock}")
+            mix_exs=""
+            if [ -f "${dir}/mix.exs" ]; then
+              mix_exs="${PWD}/${dir#./}/mix.exs"
+            fi
+
+            rm -rf "${stub}/_build"
+            status=0
+            (
+              export HEX_AUDIT_LOCK="${PWD}/${lock#./}" HEX_AUDIT_MIX_EXS="${mix_exs}"
+              cd "${stub}" && mix hex.audit
+            ) </dev/null > "${work}/out.txt" 2> "${work}/err.txt" || status=$?
+
+            sed "s/${esc}\[[0-9;]*m//g" "${work}/out.txt" > "${work}/out.clean.txt"
+            sed "s/${esc}\[[0-9;]*m//g" "${work}/err.txt" > "${work}/err.clean.txt"
+
+            read -r g o r i < <(awk '
+              /^[A-Z][A-Za-z ]*:$/ { section = $0; next }
+              /^  [^ ]/ {
+                if (section == "Advisories:") {
+                  if ($0 ~ /\((HIGH|CRITICAL)\)$/) g++; else o++
+                } else if (section == "Retired:") {
+                  r++
+                } else if (section == "Ignored advisories:" || section == "Ignored retired:") {
+                  i++
+                }
+              }
+              END { printf "%d %d %d %d\n", g, o, r, i }
+            ' "${work}/out.clean.txt")
+
+            reason=""
+            if grep -q "Failed to fetch record" "${work}/err.clean.txt"; then
+              reason="could not reach hex.pm, so the lock was not checked"
+            elif grep -q "hex-audit: the lock is not a literal map" "${work}/err.clean.txt"; then
+              reason="the lock is not a literal map, so it was not read"
+            elif [ "${status}" -ne 0 ] && [ $((g + o + r)) -eq 0 ]; then
+              reason="mix hex.audit exited ${status} without reporting a finding"
+            elif [ "${status}" -eq 0 ] && [ $((g + o + r)) -gt 0 ]; then
+              reason="mix hex.audit reported findings but exited 0"
+            elif [ "${status}" -eq 0 ] && [ $((i)) -eq 0 ] \
+              && ! grep -q "No retired or security advisory packages found" "${work}/out.clean.txt"; then
+              reason="mix hex.audit printed nothing this scan understands"
+            fi
+
+            {
+              printf '=== %s ===\n' "${lock}"
+              if [ -n "${reason}" ]; then
+                printf 'Scan failed for %s: %s\n\n' "${lock}" "${reason}"
+                tail -n 20 "${work}/err.clean.txt"
+              else
+                cat "${work}/out.clean.txt"
+                if grep -q "hex-audit: could not read the hex ignore lists" "${work}/err.clean.txt"; then
+                  printf '\nWarning: could not read the hex ignore lists in %s/mix.exs, so none were applied.\n' "${dir}"
+                fi
+              fi
+              echo
+            } | tee -a "${report}"
+
+            if [ -n "${reason}" ]; then
+              errors=$((errors + 1))
+            else
+              gated=$((gated + g))
+              other=$((other + o))
+              retired=$((retired + r))
+              ignored=$((ignored + i))
+            fi
+          done 3< "${work}/locks.txt"
+
+          {
+            echo "gated=${gated}"
+            echo "other=${other}"
+            echo "retired=${retired}"
+            echo "ignored=${ignored}"
+            echo "errors=${errors}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "HIGH or CRITICAL: ${gated}. Other advisories: ${other}. Retired: ${retired}. Ignored: ${ignored}. Scan errors: ${errors}."
+
+          if [ "${errors}" -gt 0 ]; then
+            exit 2
+          fi
+          if [ "${HEX_AUDIT_ENFORCE}" = "true" ] && [ "${gated}" -gt 0 ]; then
+            exit 1
+          fi
+
+      - name: Render findings
+        if: always()
+        env:
+          FOUND: ${{ steps.detect.outputs.found }}
+          GATED: ${{ steps.audit.outputs.gated }}
+          OTHER: ${{ steps.audit.outputs.other }}
+          RETIRED: ${{ steps.audit.outputs.retired }}
+          IGNORED: ${{ steps.audit.outputs.ignored }}
+          ERRORS: ${{ steps.audit.outputs.errors }}
+        run: |
+          work="${RUNNER_TEMP}/hex-audit"
+          mkdir -p "${work}"
+          findings="${work}/findings.md"
+
+          {
+            echo "### Hex audit"
+            echo
+            if [ "${FOUND}" != "true" ]; then
+              echo "**No \`mix.lock\` found**, so nothing was scanned."
+              echo
+              echo "No \`mix.lock\` was found within three directory levels of the"
+              echo "repository root, so the check is passing without having read anything."
+            elif [ -z "${ERRORS}" ]; then
+              echo "**The scan did not finish**, so there are no results. See the job log."
+            else
+              echo "| HIGH or CRITICAL | Other advisories | Retired | Ignored | Scan errors |"
+              echo "| --- | --- | --- | --- | --- |"
+              echo "| ${GATED} | ${OTHER} | ${RETIRED} | ${IGNORED} | ${ERRORS} |"
+              echo
+              if [ "${ERRORS}" != "0" ]; then
+                echo "**${ERRORS} lockfile(s) could not be scanned**, which fails this check."
+                echo "The report below says why."
+                echo
+              fi
+              if [ "${HEX_AUDIT_ENFORCE}" = "true" ]; then
+                echo "HIGH and CRITICAL advisories that are not ignored fail this check."
+              else
+                echo "This check reports advisories but does not fail on them yet."
+              fi
+              echo
+              echo "<details><summary>Full report</summary>"
+              echo
+              echo '```text'
+              head -c 60000 "${work}/report.txt"
+              echo '```'
+              echo
+              echo "</details>"
+              echo
+              echo "Upgrade the package, or ignore an advisory that does not affect you with"
+              echo "\`hex: [ignore_advisories: [\"<ID>\"]]\` in \`mix.exs\`, with a comment saying why."
+            fi
+            echo
+            echo "<sub>Hex ${HEX_VERSION}</sub>"
+          } > "${findings}"
+
+          cat "${findings}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Comment on the pull request
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FOUND: ${{ steps.detect.outputs.found }}
+          GATED: ${{ steps.audit.outputs.gated }}
+          OTHER: ${{ steps.audit.outputs.other }}
+          RETIRED: ${{ steps.audit.outputs.retired }}
+          ERRORS: ${{ steps.audit.outputs.errors }}
+          MARKER: "<!-- hex-audit-scan -->"
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/hex-audit"
+
+          existing=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq "[.[] | select(.user.login == \"github-actions[bot]\")
+                       | select(.body | contains(\"${MARKER}\")) | .id] | first // empty")
+
+          if [ "${FOUND}" = "true" ] && [ "${ERRORS}" = "0" ] \
+            && [ $((GATED + OTHER + RETIRED)) -eq 0 ] && [ -z "${existing}" ]; then
+            echo "Clean scan and no existing comment; nothing to post."
+            exit 0
+          fi
+
+          { echo "${MARKER}"; cat "${work}/findings.md"; } > "${work}/comment.md"
+          jq -Rs '{body: .}' < "${work}/comment.md" > "${work}/payload.json"
+
+          if [ -n "${existing}" ]; then
+            gh api --method PATCH "repos/${REPO}/issues/comments/${existing}" --input "${work}/payload.json" --silent
+            echo "Updated comment ${existing}."
+          else
+            gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" --input "${work}/payload.json" --silent
+            echo "Created a new comment."
+          fi
