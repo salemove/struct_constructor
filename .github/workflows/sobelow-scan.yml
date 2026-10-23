@@ -54,7 +54,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3  # v6 (node24)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1 (node24)
         with:
           persist-credentials: false
 
@@ -105,7 +105,7 @@ jobs:
       - name: Cache Sobelow escript
         id: cache-sobelow
         if: steps.detect.outputs.found == 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.mix/escripts
           key: ${{ runner.os }}-sobelow-${{ env.SOBELOW_VERSION }}-otp${{ env.OTP_VERSION }}-elixir${{ env.ELIXIR_VERSION }}
