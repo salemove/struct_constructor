@@ -24,17 +24,17 @@ jobs:
       SNYK_CFG_ORG: ${{ vars.SNYK_ORGANIZATION_SLUG }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Snyk CLI
-        uses: snyk/actions/setup@cdb760004ba9ea4d525f2e043745dfe85bb9077e
+        uses: snyk/actions/setup@9adf32b1121593767fc3c057af55b55db032dc04 # v1.0.0
         with:
           snyk-version: v1.1307.4
 
       - name: Set up Elixir
-        uses: erlef/setup-beam@5304e04ea2b355f03681464e683d92e3b2f18451
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           otp-version: '27'
           elixir-version: '1.18'
