@@ -119,14 +119,21 @@ jobs:
           mix local.hex --force
           mix escript.install hex sobelow "${SOBELOW_VERSION}" --force
 
-      # Deliberately no --exit: findings are reported but do not fail the check
-      # yet. The gate is switched on per the rollout plan, once each
-      # repository's existing backlog has been triaged.
+      # --exit low fails the check on any reported finding. Sobelow grades by
+      # confidence, not severity, and downgrades most code findings outside a
+      # Phoenix controller to low, so a medium or high threshold would let
+      # command injection through. A finding leaves the check by being fixed
+      # or suppressed in the repository, where the suppression is reviewed.
+      #
+      # The flag is on the command line so it wins over `exit:` in a
+      # repository's .sobelow-conf. Many of those files say `exit: false`
+      # only because `mix sobelow --save-config` writes that default.
       #
       # --skip honours the `#sobelow_skip` annotations teams already maintain
       # for their Jenkins `mix lint` run. --private suppresses the upstream
       # version check, which would otherwise make a network call on every run.
       - name: Run Sobelow
+        id: scan
         if: steps.detect.outputs.found == 'true'
         run: |
           set -o pipefail
@@ -160,9 +167,10 @@ jobs:
             # ${ignore_flag} is deliberately unquoted: it is a flag plus its
             # value, or nothing at all.
             # shellcheck disable=SC2086
-            "${HOME}/.mix/escripts/sobelow" --root "${root}" ${ignore_flag} --skip --private </dev/null 2>&1 \
+            "${HOME}/.mix/escripts/sobelow" --root "${root}" ${ignore_flag} --exit low --skip --private </dev/null 2>&1 \
               | tee -a sobelow-output.txt || status=$?
           done 3< sobelow-roots.txt
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
           exit "${status}"
 
       # Sobelow colours its output, which renders as escape-code noise
@@ -184,7 +192,7 @@ jobs:
           {
             echo "### Sobelow ${SOBELOW_VERSION}"
             echo
-            echo "${count:-0} finding(s). This check does not fail on findings."
+            echo "${count:-0} finding(s). This check fails on any finding."
             echo
             echo '```text'
             head -c 60000 sobelow-clean.txt
@@ -206,6 +214,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           FOUND: ${{ steps.detect.outputs.found }}
           COUNT: ${{ steps.render.outputs.count }}
+          SCAN_STATUS: ${{ steps.scan.outputs.status }}
           MARKER: "<!-- sobelow-scan -->"
         run: |
           set -euo pipefail
@@ -235,11 +244,17 @@ jobs:
               echo "repository root. If this repository is meant to be covered by the"
               echo "\`sobelow\` ruleset then that is worth a look, because the check is"
               echo "passing without having analysed anything."
+            elif [ "${COUNT:-0}" = "0" ] && [ "${SCAN_STATUS:-0}" != "0" ]; then
+              # A non-zero exit with nothing counted is Sobelow failing to run,
+              # not a finding. Say so, or the comment reads "No findings" next
+              # to a red check.
+              echo "**Sobelow exited with status ${SCAN_STATUS} without reporting a finding.**"
+              echo "The scan did not complete. The job log has the error."
             elif [ "${COUNT:-0}" = "0" ]; then
               echo "No findings."
             else
-              echo "**${COUNT} finding(s).** This check reports them but does not fail on"
-              echo "them, and does not block merging."
+              echo "**${COUNT} finding(s).** This check fails on any finding. Fix each"
+              echo "one, or suppress it with its reason."
               echo
               echo "<details><summary>Findings</summary>"
               echo
